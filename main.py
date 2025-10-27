@@ -216,4 +216,108 @@ def send_gmail_notification(to_email: str, subject: str, body_text: str) -> bool
     return False
 
 
-# ----------------- Google Calendar Event Creation --------------
+# ----------------- Google Calendar Event Creation -----------------
+def create_google_calendar_event(summary: str, start_iso: str, end_iso: str, attendees: List[str]) -> Dict[str, Any]:
+    if cfg.mock or not (cfg.GOOGLE_API_TOKEN and cfg.GOOGLE_CALENDAR_ID):
+        log.info(f"[MOCK] Creating calendar event '{summary}' {start_iso} -> {end_iso} for {attendees}")
+        return {"id": "mock_event_1", "htmlLink": "https://calendar.google.com/mock/event123"}
+
+    url = f"https://www.googleapis.com/calendar/v3/calendars/{cfg.GOOGLE_CALENDAR_ID}/events"
+    headers = {"Authorization": f"Bearer {cfg.GOOGLE_API_TOKEN}", "Content-Type": "application/json"}
+    body = {
+        "summary": summary,
+        "start": {"dateTime": start_iso},
+        "end": {"dateTime": end_iso},
+        "attendees": [{"email": e} for e in attendees],
+        "conferenceData": {"createRequest": {"requestId": f"req-{int(datetime.now().timestamp())}","conferenceSolutionKey": {"type": "hangoutsMeet"}}}
+    }
+    r = requests.post(url, headers=headers, json=body)
+    r.raise_for_status()
+    return r.json()
+
+
+# ----------------- Orchestrator -----------------
+def process_meeting(meeting_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    meeting_payload is expected to have keys e.g. {"meetingId": "...", "source": "fireflies", ...}
+    Returns a summary of actions performed.
+    """
+    meeting_id = meeting_payload.get("meetingId") or meeting_payload.get("transcriptId") or meeting_payload.get("id") or "demo_meeting_1"
+    log.info(f"Processing meeting {meeting_id}")
+
+    transcript = fetch_transcript_from_fireflies(meeting_id)
+    analysis = analyze_transcript_with_openai(transcript)
+
+    # Create tasks for "me"
+    tasks_created = []
+    if analysis.get("tasks_for_me"):
+        tasks_created = create_airtable_tasks(analysis["tasks_for_me"])
+        log.info(f"Created {len(tasks_created)} tasks for me in Airtable/mock.")
+
+    # Create tasks for participants and notify them
+    participant_notifications = []
+    for p in analysis.get("participant_tasks", []):
+        participant_email = p.get("participant_email")
+        tasks = p.get("tasks", [])
+        # create tasks assigned to participant? In this example, we store them in the same Airtable table with description containing assignee
+        # For simplicity, create and notify
+        created = create_airtable_tasks(tasks)
+        log.info(f"Created {len(created)} participant tasks for {participant_email}")
+        # Send a notification only for that participant's tasks
+        message = f"Hello,\n\nHere are your action items from the meeting '{transcript.get('title') }':\n"
+        for t in tasks:
+            message += f"- {t['name']} (Due {t.get('due_date')})\n  {t.get('description')}\n"
+        message += "\nRegards,\nAuto Agent"
+        sent = send_gmail_notification(participant_email, f"Action items: {transcript.get('title')}", message)
+        participant_notifications.append({"email": participant_email, "sent": sent})
+
+    # Notify clients as instructed in notify_items (AI-provided)
+    notify_results = []
+    for n in analysis.get("notify_items", []):
+        to = n.get("participant_email")
+        msg = n.get("message") or n.get("body") or "You have tasks assigned."
+        sent = send_gmail_notification(to, f"Tasks from {transcript.get('title')}", msg)
+        notify_results.append({"to": to, "sent": sent})
+
+    # If follow-up requested, create a calendar event
+    follow_up_result = None
+    if analysis.get("follow_up") and analysis["follow_up"].get("required"):
+        fu = analysis["follow_up"]
+        attendees = [fu.get("attendee_email")] if fu.get("attendee_email") else transcript.get("participants", [])
+        created_event = create_google_calendar_event(
+            fu.get("meeting_name", f"Follow-up: {transcript.get('title')}"),
+            fu.get("suggested_start"),
+            fu.get("suggested_end"),
+            attendees
+        )
+        follow_up_result = created_event
+        log.info(f"Created follow-up: {created_event.get('htmlLink')}")
+
+    return {
+        "meeting_id": meeting_id,
+        "tasks_created_for_me": tasks_created,
+        "participant_notifications": participant_notifications,
+        "notify_results": notify_results,
+        "follow_up_result": follow_up_result,
+    }
+
+
+# ----------------- Simple CLI / Webhook Simulation -----------------
+def main():
+    # For quick testing allow passing a local JSON file or meeting id via env/args
+    test_meeting = os.getenv("TEST_MEETING_JSON")
+    test_meeting_id = os.getenv("TEST_MEETING_ID")
+
+    if test_meeting:
+        with open(test_meeting, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    else:
+        payload = {"meetingId": test_meeting_id or "demo_meeting_1"}
+
+    result = process_meeting(payload)
+    log.info("Processing result:\n" + json.dumps(result, indent=2))
+    print(json.dumps(result, indent=2))
+
+
+if __name__ == "__main__":
+    main()
